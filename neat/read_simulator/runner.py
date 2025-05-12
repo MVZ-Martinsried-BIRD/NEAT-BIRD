@@ -1,24 +1,114 @@
 """
 Runner for generate_reads task
 """
+
 import time
 import logging
 import pickle
 import gzip
+from multiprocessing import Pool, cpu_count  # Added import
 
 from Bio import SeqIO
 from pathlib import Path
 
-from .utils import Options, parse_input_vcf, parse_beds, OutputFileWriter, \
-    generate_variants, generate_reads
+from .utils import (
+    Options,
+    parse_input_vcf,
+    parse_beds,
+    OutputFileWriter,
+    generate_variants,
+    generate_reads,
+)
 from ..common import validate_input_path, validate_output_path
-from ..models import MutationModel, SequencingErrorModel, FragmentLengthModel, TraditionalQualityModel
+from ..models import (
+    MutationModel,
+    SequencingErrorModel,
+    FragmentLengthModel,
+    TraditionalQualityModel,
+)
 from ..models.default_cancer_mutation_model import *
 from ..variants import ContigVariants
 
 __all__ = ["read_simulator_runner"]
 
 _LOG = logging.getLogger(__name__)
+
+
+def _process_single_contig(args):
+    """
+    Helper function to process a single contig.
+    This function is designed to be called by multiprocessing.Pool.
+    """
+    (
+        contig,
+        reference_contig_seq,
+        input_variants_contig,
+        mutation_rate_dict_contig,
+        target_regions_dict_contig,
+        discard_regions_dict_contig,
+        mut_model,
+        seq_error_model_1,
+        seq_error_model_2,
+        qual_score_model_1,
+        qual_score_model_2,
+        fraglen_model,
+        options,
+    ) = args
+
+    _LOG.info(f"Generating variants for {contig}")
+
+    local_bam_pickle_file = None
+    if options.produce_bam:
+        # Removed threadidx from filename, not relevant for multiprocessing
+        local_bam_pickle_file = (
+            options.temp_dir_path / f"{options.output.stem}_tmp_{contig}.p.gz"
+        )
+
+    if options.paired_ended:
+        max_qual_score = max(
+            max(qual_score_model_1.quality_scores),
+            max(qual_score_model_2.quality_scores),
+        )
+    else:
+        max_qual_score = max(qual_score_model_1.quality_scores)
+
+    local_variants = generate_variants(
+        reference=reference_contig_seq,
+        mutation_rate_regions=mutation_rate_dict_contig,
+        existing_variants=input_variants_contig,
+        mutation_model=mut_model,
+        max_qual_score=max_qual_score,
+        options=options,
+    )
+
+    contig_fastq_files = None
+    if options.produce_fastq or options.produce_bam:
+        (
+            read1_fastq_paired,
+            read1_fastq_single,
+            read2_fastq_paired,
+            read2_fastq_single,
+        ) = generate_reads(
+            reference_contig_seq,
+            local_bam_pickle_file,
+            seq_error_model_1,
+            seq_error_model_2,
+            qual_score_model_1,
+            qual_score_model_2,
+            fraglen_model,
+            local_variants,
+            options.temp_dir_path,
+            target_regions_dict_contig,
+            discard_regions_dict_contig,
+            options,
+            contig,
+        )
+        contig_fastq_files = (
+            (read1_fastq_paired, read2_fastq_paired),
+            (read1_fastq_single, read2_fastq_single),
+        )
+
+    return contig, local_variants, contig_fastq_files, local_bam_pickle_file
 
 
 def initialize_all_models(options: Options):
@@ -54,7 +144,7 @@ def initialize_all_models(options: Options):
             homozygous_freq=default_cancer_homozygous_freq,
             variant_probs=default_cancer_variant_probs,
             insert_len_model=default_cancer_insert_len_model,
-            is_cancer=True
+            is_cancer=True,
         )
 
     _LOG.debug("Mutation models loaded")
@@ -69,8 +159,10 @@ def initialize_all_models(options: Options):
                 error_model_2 = error_models["error_model2"]
                 quality_score_model_2 = error_models["qual_score_model2"]
             else:
-                _LOG.warning('Paired ended mode declared, but input sequencing error model is single ended,'
-                             'duplicating model for both ends')
+                _LOG.warning(
+                    "Paired ended mode declared, but input sequencing error model is single ended,"
+                    "duplicating model for both ends"
+                )
                 error_model_2 = error_models["error_model1"]
                 quality_score_model_2 = error_models["qual_score_model1"]
         else:
@@ -88,13 +180,15 @@ def initialize_all_models(options: Options):
             error_model_2 = None
             quality_score_model_2 = None
 
-    _LOG.debug('Sequencing error and quality score models loaded')
+    _LOG.debug("Sequencing error and quality score models loaded")
 
     if options.fragment_model:
         fraglen_model = pickle.load(gzip.open(options.fragment_model))
         fraglen_model.rng = options.rng
     elif options.fragment_mean:
-        fraglen_model = FragmentLengthModel(options.fragment_mean, options.fragment_st_dev)
+        fraglen_model = FragmentLengthModel(
+            options.fragment_mean, options.fragment_st_dev
+        )
     else:
         # For single ended, fragment length will be based on read length
         fragment_mean = options.read_len * 2.0
@@ -103,14 +197,15 @@ def initialize_all_models(options: Options):
 
     _LOG.debug("Fragment length model loaded")
 
-    return \
-        mut_model, \
-        cancer_model, \
-        error_model_1, \
-        error_model_2, \
-        quality_score_model_1, \
-        quality_score_model_2, \
-        fraglen_model
+    return (
+        mut_model,
+        cancer_model,
+        error_model_1,
+        error_model_2,
+        quality_score_model_1,
+        quality_score_model_2,
+        fraglen_model,
+    )
 
 
 def read_simulator_runner(config: str, output: str):
@@ -132,10 +227,10 @@ def read_simulator_runner(config: str, output: str):
     FileExistsError
         If the output file already exists.
     """
-    _LOG.debug(f'config = {config}')
-    _LOG.debug(f'output = {output}')
+    _LOG.debug(f"config = {config}")
+    _LOG.debug(f"output = {output}")
 
-    _LOG.info(f'Using configuration file {config}')
+    _LOG.info(f"Using configuration file {config}")
     config = Path(config).resolve()
     validate_input_path(config)
 
@@ -144,7 +239,7 @@ def read_simulator_runner(config: str, output: str):
     output = Path(output).resolve()
 
     if not output.parent.is_dir():
-        _LOG.info('Creating output dir')
+        _LOG.info("Creating output dir")
         output.parent.mkdir(parents=True, exist_ok=True)
 
     # Read options file
@@ -167,17 +262,19 @@ def read_simulator_runner(config: str, output: str):
         seq_error_model_2,
         qual_score_model_1,
         qual_score_model_2,
-        fraglen_model
+        fraglen_model,
     ) = initialize_all_models(options)
 
     """
     Process Inputs
     """
-    _LOG.info(f'Reading {options.reference}.')
+    _LOG.info(f"Reading {options.reference}.")
 
     # TODO check into SeqIO.index_db()
     reference_index = SeqIO.index(str(options.reference), "fasta")
-    reference_keys_with_lens = {key: len(value) for key, value in reference_index.items()}
+    reference_keys_with_lens = {
+        key: len(value) for key, value in reference_index.items()
+    }
     _LOG.debug("Reference file indexed.")
 
     if _LOG.getEffectiveLevel() < 20:
@@ -198,11 +295,11 @@ def read_simulator_runner(config: str, output: str):
                 mut_model.homozygous_freq,
                 reference_index,
                 options,
-                tumor_normal=True
+                tumor_normal=True,
             )
 
-            tumor_ind = sample_names['tumor_sample']
-            normal_ind = sample_names['normal_sample']
+            tumor_ind = sample_names["tumor_sample"]
+            normal_ind = sample_names["normal_sample"]
         else:
             # TODO Check if we need full ref index or just keys and lens
             sample_names = parse_input_vcf(
@@ -211,7 +308,7 @@ def read_simulator_runner(config: str, output: str):
                 options.ploidy,
                 mut_model.homozygous_freq,
                 reference_index,
-                options
+                options,
             )
 
         _LOG.debug("Finished reading input vcf file")
@@ -223,11 +320,9 @@ def read_simulator_runner(config: str, output: str):
     if any(bed_files):
         _LOG.info(f"Reading input bed files.")
 
-    (
-        target_regions_dict,
-        discard_regions_dict,
-        mutation_rate_dict
-    ) = parse_beds(options, reference_keys_with_lens, mut_model.avg_mut_rate)
+    (target_regions_dict, discard_regions_dict, mutation_rate_dict) = parse_beds(
+        options, reference_keys_with_lens, mut_model.avg_mut_rate
+    )
 
     if any(bed_files):
         _LOG.debug("Finished reading input beds.")
@@ -243,19 +338,18 @@ def read_simulator_runner(config: str, output: str):
     # Also creates headers for bam and vcf.
     # We'll also keep track here of what files we are producing.
     if options.cancer:
-        output_normal = options.output.parent / f'{options.output.name}_normal'
-        output_tumor = options.output.parent / f'{options.output.name}_tumor'
-        output_file_writer = OutputFileWriter(options=options,
-                                              bam_header=bam_header)
-        output_file_writer_cancer = OutputFileWriter(options=options,
-                                                     bam_header=bam_header)
+        output_normal = options.output.parent / f"{options.output.name}_normal"
+        output_tumor = options.output.parent / f"{options.output.name}_tumor"
+        output_file_writer = OutputFileWriter(options=options, bam_header=bam_header)
+        output_file_writer_cancer = OutputFileWriter(
+            options=options, bam_header=bam_header
+        )
     else:
         outfile = options.output.parent / options.output.name
-        output_file_writer = OutputFileWriter(options=options,
-                                              bam_header=bam_header)
+        output_file_writer = OutputFileWriter(options=options, bam_header=bam_header)
         output_file_writer_cancer = None
 
-    _LOG.debug(f'Output files ready for writing.')
+    _LOG.debug(f"Output files ready for writing.")
 
     """
     Begin Analysis
@@ -267,72 +361,58 @@ def read_simulator_runner(config: str, output: str):
     _LOG.debug("Input reference partitioned for run")
 
     # these will be the features common to each contig, for multiprocessing
-    common_features = {}
+    # common_features = {} # This variable was unused
 
     local_variant_files = {}
     fastq_files = []
-
     sam_reads_files = []
 
+    # Prepare arguments for multiprocessing
+    process_args = []
     for contig in breaks:
-        local_variant_files[contig] = None
+        # We pass the actual sequence record for the contig now
+        reference_contig_seq = reference_index[contig]
+        input_variants_contig = input_variants_dict[contig]
+        mutation_rate_dict_contig = mutation_rate_dict[contig]
+        target_regions_dict_contig = target_regions_dict[contig]
+        discard_regions_dict_contig = discard_regions_dict[contig]
 
-        _LOG.info(f"Generating variants for {contig}")
-
-        input_variants = input_variants_dict[contig]
-        # TODO: add the ability to pick up input variants here from previous loop
-
-        local_reference = reference_index[contig]
-
-        # Since we're only running single threaded for now:
-        threadidx = 1
-
-        local_bam_pickle_file = None
-        if options.produce_bam:
-            local_bam_pickle_file = options.temp_dir_path / f'{options.output.stem}_tmp_{contig}_{threadidx}.p.gz'
-
-        if threadidx == 1:
-            # init_progress_info()
-            pass
-
-        if options.paired_ended:
-            max_qual_score = max(max(qual_score_model_1.quality_scores), max(qual_score_model_2.quality_scores))
-        else:
-            max_qual_score = max(qual_score_model_1.quality_scores)
-
-        local_variants = generate_variants(
-            reference=local_reference,
-            mutation_rate_regions=mutation_rate_dict[contig],
-            existing_variants=input_variants,
-            mutation_model=mut_model,
-            max_qual_score=max_qual_score,
-            options=options
-        )
-
-        # This function saves the local variant data a dictionary. We may need to write this to file.
-        local_variant_files[contig] = local_variants
-
-        if options.produce_fastq or options.produce_bam:
-            read1_fastq_paired, read1_fastq_single, read2_fastq_paired, read2_fastq_single = generate_reads(
-                local_reference,
-                local_bam_pickle_file,
+        process_args.append(
+            (
+                contig,
+                reference_contig_seq,
+                input_variants_contig,
+                mutation_rate_dict_contig,
+                target_regions_dict_contig,
+                discard_regions_dict_contig,
+                mut_model,
                 seq_error_model_1,
                 seq_error_model_2,
                 qual_score_model_1,
                 qual_score_model_2,
                 fraglen_model,
-                local_variants,
-                options.temp_dir_path,
-                target_regions_dict[contig],
-                discard_regions_dict[contig],
                 options,
-                contig,
-                )
+            )
+        )
 
-            contig_temp_fastqs = ((read1_fastq_paired, read2_fastq_paired), (read1_fastq_single, read2_fastq_single))
+    # Determine number of processes
+    # Use options.threads if specified and > 0, otherwise use cpu_count
+    num_processes = (
+        options.threads if options.threads and options.threads > 0 else cpu_count()
+    )
+    _LOG.info(f"Using {num_processes} processes for contig processing.")
+
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(_process_single_contig, process_args)
+
+    # Process results
+    for result in results:
+        contig, local_variants, contig_temp_fastqs, local_bam_pickle_file = result
+        local_variant_files[contig] = local_variants
+        if contig_temp_fastqs:
             fastq_files.append(contig_temp_fastqs)
-            if options.produce_bam:
-                sam_reads_files.append(local_bam_pickle_file)
+        if local_bam_pickle_file:
+            sam_reads_files.append(local_bam_pickle_file)
 
     if options.produce_vcf:
         _LOG.info(f"Outputting golden vcf: {str(output_file_writer.vcf_fn)}")
@@ -340,8 +420,10 @@ def read_simulator_runner(config: str, output: str):
 
     if options.produce_fastq:
         if options.paired_ended:
-            _LOG.info(f"Outputting fastq files: "
-                      f"{', '.join([str(x) for x in output_file_writer.fastq_fns]).strip(', ')}")
+            _LOG.info(
+                f"Outputting fastq files: "
+                f"{', '.join([str(x) for x in output_file_writer.fastq_fns]).strip(', ')}"
+            )
         else:
             _LOG.info(f"Outputting fastq file: {output_file_writer.fastq_fns[0]}")
         output_file_writer.merge_temp_fastqs(fastq_files, options.rng)
@@ -350,7 +432,9 @@ def read_simulator_runner(config: str, output: str):
         _LOG.info(f"Outputting golden bam file: {str(output_file_writer.bam_fn)}")
         contig_list = list(reference_keys_with_lens)
         contigs_by_index = {contig_list[n]: n for n in range(len(contig_list))}
-        output_file_writer.output_bam_file(sam_reads_files, contigs_by_index, options.read_len)
+        output_file_writer.output_bam_file(
+            sam_reads_files, contigs_by_index, options.read_len
+        )
 
 
 def find_file_breaks(reference_keys_with_lens: dict) -> dict:

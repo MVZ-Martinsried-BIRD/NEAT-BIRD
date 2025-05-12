@@ -1,0 +1,13 @@
+reference: /srv/ngsdata/Data/Genome_builds/GRCh38_latest_genomic_masked.fa
+read_len: 159
+coverage: 10.0
+error_model: /home/kstraka/repos/NEAT-BIRD/seq_err.p.gz
+mutation_model: /home/kstraka/repos/NEAT-BIRD/mut_model.pickle.gz
+fragment_model: /home/kstraka/repos/NEAT-BIRD/fraglen_model.pickle.gz
+produce_bam: False
+produce_vcf: False
+paired_ended: True
+fragment_mean: 300
+fragment_st_dev: 30
+targed_bed: /srv/ngsdata/Data/bed_files/TwistWE_v1/TwistWE_v1_allTargets_padding20.bed
+threads: 4
