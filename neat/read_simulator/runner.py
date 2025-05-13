@@ -57,12 +57,12 @@ def _process_single_contig(args):
 
     _LOG.info(f"Generating variants for {contig}")
 
-    local_bam_pickle_file = None
-    if options.produce_bam:
-        # Removed threadidx from filename, not relevant for multiprocessing
-        local_bam_pickle_file = (
-            options.temp_dir_path / f"{options.output.stem}_tmp_{contig}.p.gz"
-        )
+    local_bam_pickle_file = None  # This will now hold in-memory SAM order data
+    # if options.produce_bam:
+    #     # Removed threadidx from filename, not relevant for multiprocessing
+    #     local_bam_pickle_file = (
+    #         options.temp_dir_path / f"{options.output.stem}_tmp_{contig}.p.gz"
+    #     )
 
     if options.paired_ended:
         max_qual_score = max(
@@ -81,34 +81,39 @@ def _process_single_contig(args):
         options=options,
     )
 
-    contig_fastq_files = None
+    contig_fastq_files = None  # This will now hold in-memory FASTQ data
+    contig_sam_order_data = None  # This will hold in-memory SAM order data for BAM
+
     if options.produce_fastq or options.produce_bam:
         (
-            read1_fastq_paired,
-            read1_fastq_single,
-            read2_fastq_paired,
-            read2_fastq_single,
+            fastq_data_for_contig,  # Tuple: (paired_reads_list, singleton_reads_list)
+            sam_order_data_for_contig,  # List of (read1, read2 or None) tuples
         ) = generate_reads(
             reference_contig_seq,
-            local_bam_pickle_file,
+            # local_bam_pickle_file, # Removed, SAM data handled by sam_order_data_for_contig
             seq_error_model_1,
             seq_error_model_2,
             qual_score_model_1,
             qual_score_model_2,
             fraglen_model,
             local_variants,
-            options.temp_dir_path,
+            # options.temp_dir_path, # Removed
             target_regions_dict_contig,
             discard_regions_dict_contig,
             options,
             contig,
         )
+        # contig_fastq_files = (
+        #     (read1_fastq_paired, read2_fastq_paired),
+        #     (read1_fastq_single, read2_fastq_single),
+        # ) # Old structure based on file paths
         contig_fastq_files = (
-            (read1_fastq_paired, read2_fastq_paired),
-            (read1_fastq_single, read2_fastq_single),
+            fastq_data_for_contig  # New: directly assign the tuple of lists
         )
+        if options.produce_bam:
+            contig_sam_order_data = sam_order_data_for_contig
 
-    return contig, local_variants, contig_fastq_files, local_bam_pickle_file
+    return contig, local_variants, contig_fastq_files, contig_sam_order_data
 
 
 def initialize_all_models(options: Options):
@@ -363,9 +368,15 @@ def read_simulator_runner(config: str, output: str):
     # these will be the features common to each contig, for multiprocessing
     # common_features = {} # This variable was unused
 
-    local_variant_files = {}
-    fastq_files = []
-    sam_reads_files = []
+    local_variant_files = (
+        {}
+    )  # Renamed to reflect it stores variant objects/data per contig
+    # fastq_files = [] # Will now store in-memory FASTQ data directly
+    all_fastq_data = (
+        []
+    )  # List to store (paired_reads_list, singleton_reads_list) tuples from each contig
+    # sam_reads_files = [] # Will now store in-memory SAM order data directly
+    all_sam_order_data = []  # List to store SAM order data lists from each contig
 
     # Prepare arguments for multiprocessing
     process_args = []
@@ -407,12 +418,12 @@ def read_simulator_runner(config: str, output: str):
 
     # Process results
     for result in results:
-        contig, local_variants, contig_temp_fastqs, local_bam_pickle_file = result
+        contig, local_variants, contig_fastq_data, contig_sam_data = result
         local_variant_files[contig] = local_variants
-        if contig_temp_fastqs:
-            fastq_files.append(contig_temp_fastqs)
-        if local_bam_pickle_file:
-            sam_reads_files.append(local_bam_pickle_file)
+        if contig_fastq_data:  # This is now (paired_list, singleton_list)
+            all_fastq_data.append(contig_fastq_data)
+        if contig_sam_data:  # This is now the list of SAM ordered read tuples
+            all_sam_order_data.append(contig_sam_data)
 
     if options.produce_vcf:
         _LOG.info(f"Outputting golden vcf: {str(output_file_writer.vcf_fn)}")
@@ -426,14 +437,18 @@ def read_simulator_runner(config: str, output: str):
             )
         else:
             _LOG.info(f"Outputting fastq file: {output_file_writer.fastq_fns[0]}")
-        output_file_writer.merge_temp_fastqs(fastq_files, options.rng)
+        output_file_writer.write_fastqs_from_memory(
+            all_fastq_data, options.rng
+        )  # Changed from merge_temp_fastqs
 
     if options.produce_bam:
         _LOG.info(f"Outputting golden bam file: {str(output_file_writer.bam_fn)}")
         contig_list = list(reference_keys_with_lens)
         contigs_by_index = {contig_list[n]: n for n in range(len(contig_list))}
         output_file_writer.output_bam_file(
-            sam_reads_files, contigs_by_index, options.read_len
+            all_sam_order_data,
+            contigs_by_index,
+            options.read_len,  # Changed from sam_reads_files
         )
 
 
