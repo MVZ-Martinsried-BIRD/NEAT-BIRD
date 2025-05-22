@@ -93,6 +93,7 @@ class OutputFileWriter:
         self.write_bam = options.produce_bam
         self.write_vcf = options.produce_vcf
         self.paired = options.paired_ended
+        self.first_fastq_write = True  # New flag for appending FASTQ data
 
         self.bam_header = bam_header
 
@@ -223,6 +224,7 @@ class OutputFileWriter:
         """
         Takes lists of in-memory read objects and combines them into final output fastq files.
         The reads are shuffled to make the output more realistic.
+        For the first call, files are written (truncated). For subsequent calls, data is appended.
 
         :param reads_data: A list of tuples, where each tuple contains two lists:
                            (list_of_paired_read_tuples, list_of_singleton_read_tuples).
@@ -242,56 +244,81 @@ class OutputFileWriter:
         rand_num_gen.shuffle(all_paired_reads)
         rand_num_gen.shuffle(all_singleton_reads)
 
-        wrote_r2 = False
-        with open_output(self.fastq1_fn) as fq1:
-            # Handle dummy file for single-ended fastq output
-            fq2_handle_cm = (
-                open_output(self.fastq2_fn)
-                if self.paired
-                else open(
-                    (
-                        Path(self.temporary_dir / "dummy.fastq.gz")
-                        if hasattr(self, "temporary_dir")
-                        else Path("/dev/null")
-                    ),
-                    "wb",
-                )
-            )  # Ensure dummy.fastq.gz is handled if not paired
+        file_mode = "wt" if self.first_fastq_write else "at"
+        wrote_r2 = False  # To check if R2 file actually gets data in paired-end mode
 
-            with fq2_handle_cm as fq2:
-                # First we add all properly paired reads
+        # Ensure dummy.fastq.gz is handled if not paired, using a temporary path if self.temporary_dir was removed
+        # For append mode, opening /dev/null in 'at' might not be ideal, but it's for a dummy file.
+        # Let's ensure the dummy file path is valid even if temporary_dir is gone.
+        # It's better to ensure dummy_fastq_path is defined and cleaned up if it's a real file.
+        dummy_fastq_path = None
+        if not self.paired:
+            # Create a temporary dummy file path if needed, but it won't be written to in append mode if opened with /dev/null logic
+            # The original logic created a dummy file in temporary_dir. If that's gone, we need a placeholder.
+            # However, if we are appending, we only care about self.fastq1_fn.
+            # The fq2_handle_cm logic needs to be robust.
+            if self.fastq2_fn and Path(self.fastq2_fn).name == "dummy.fastq.gz":
+                dummy_fastq_path = self.fastq2_fn  # Use the defined dummy path
+                # If it's the first write and not paired, dummy.fastq.gz might be created by open_output if path is real.
+                # If appending, and not paired, fq2 is effectively /dev/null.
+
+        with open_output(self.fastq1_fn, mode=file_mode) as fq1:
+            fq2_cm = (
+                open(
+                    Path(dummy_fastq_path if dummy_fastq_path else "/dev/null"),
+                    (
+                        file_mode
+                        if dummy_fastq_path and self.first_fastq_write
+                        else ("at" if dummy_fastq_path else "a")
+                    ),
+                )
+                if not self.paired
+                else open_output(self.fastq2_fn, mode=file_mode)
+            )
+
+            with fq2_cm as fq2:
                 num_paired_reads = len(all_paired_reads)
                 for i in range(num_paired_reads):
-                    # print(f'{i/num_paired_reads:.2%}', end='\r') # Optional progress indicator
                     read1_obj, read2_obj = all_paired_reads[i]
-                    # Assuming Read objects have a method to_fastq_record() or similar
-                    # Or direct attributes to construct SeqRecord if not already Bio.SeqRecord.SeqRecord
-                    # For this example, let's assume direct writing of string representations
-                    # (This part needs to align with how Read objects store their FASTQ data)
-                    fq1.write(
-                        read1_obj.to_fastq_string()
-                    )  # Placeholder for actual FASTQ string generation
+                    fq1.write(read1_obj.to_fastq_string())
                     if self.paired:
-                        fq2.write(read2_obj.to_fastq_string())  # Placeholder
+                        fq2.write(read2_obj.to_fastq_string())
                         if not wrote_r2:
                             wrote_r2 = True
 
-                # Next we add the singletons (or all reads, for single-ended)
                 num_singleton_reads = len(all_singleton_reads)
                 for j in range(num_singleton_reads):
-                    read_obj, _ = all_singleton_reads[
-                        j
-                    ]  # Singleton is (Read_obj, None)
-                    fq1.write(read_obj.to_fastq_string())  # Placeholder
+                    read_obj, _ = all_singleton_reads[j]
+                    fq1.write(read_obj.to_fastq_string())
 
+        if self.first_fastq_write:
+            self.first_fastq_write = False
+
+        # Cleanup dummy file if it was created and is no longer needed.
+        # This cleanup should only happen if it's a real file and not /dev/null.
         if (
             not self.paired
-            and Path(self.fastq2_fn).name == "dummy.fastq.gz"
-            and Path(self.fastq2_fn).exists()
+            and dummy_fastq_path
+            and dummy_fastq_path.exists()
+            and dummy_fastq_path.name == "dummy.fastq.gz"
         ):
-            Path(self.fastq2_fn).unlink()  # Clean up dummy file
+            # This condition might need refinement: only delete if it was specifically the dummy file we managed.
+            # The original logic deleted it if not self.paired.
+            # If we are appending, this dummy file might not even be "created" in a meaningful way by later appends.
+            # For now, retain original cleanup logic but ensure it targets the specific dummy file.
+            if (
+                not wrote_r2
+            ):  # If R2 was never written to (e.g. single-end or no paired reads)
+                try:
+                    dummy_fastq_path.unlink(missing_ok=True)
+                except (
+                    AttributeError
+                ):  # In case dummy_fastq_path is not a Path object (e.g. from /dev/null context)
+                    pass
 
-        _LOG.info(f"Fastq(s) written in {(time.time() - t)/60:.2f} m")
+        _LOG.info(
+            f"Fastq(s) data processed in {(time.time() - t)/60:.2f} m. Mode: {file_mode}"
+        )
 
     def output_bam_file(
         self, all_sam_order_data: list, contig_dict: dict, read_length: int

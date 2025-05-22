@@ -29,91 +29,55 @@ from ..models import (
 from ..models.default_cancer_mutation_model import *
 from ..variants import ContigVariants
 
+from Bio.SeqRecord import SeqRecord  # Added import
+from math import ceil  # Added import
+
 __all__ = ["read_simulator_runner"]
 
 _LOG = logging.getLogger(__name__)
 
 
-def _process_single_contig(args):
+# New helper function to generate reads for a chunk of a chromosome
+def _generate_reads_for_chunk(args_tuple):
     """
-    Helper function to process a single contig.
-    This function is designed to be called by multiprocessing.Pool.
+    Generates reads for a given chunk of a chromosome.
+    Designed to be called by multiprocessing.Pool.
     """
     (
-        contig,
-        reference_contig_seq,
-        input_variants_contig,
-        mutation_rate_dict_contig,
-        target_regions_dict_contig,
-        discard_regions_dict_contig,
-        mut_model,
+        task_id,  # For logging, e.g., "chr1_chunk0"
+        original_chrom_id,
+        chunk_start_offset,
+        reference_chunk_seqrecord,  # SeqRecord for the chunk
+        variants_for_chromosome,  # ContigVariants for the entire original chromosome
         seq_error_model_1,
         seq_error_model_2,
         qual_score_model_1,
         qual_score_model_2,
         fraglen_model,
+        target_regions_for_chromosome,  # Already filtered for the chromosome
+        discard_regions_for_chromosome,  # Already filtered for the chromosome
         options,
-    ) = args
+    ) = args_tuple
 
-    _LOG.info(f"Generating variants for {contig}")
-
-    local_bam_pickle_file = None  # This will now hold in-memory SAM order data
-    # if options.produce_bam:
-    #     # Removed threadidx from filename, not relevant for multiprocessing
-    #     local_bam_pickle_file = (
-    #         options.temp_dir_path / f"{options.output.stem}_tmp_{contig}.p.gz"
-    #     )
-
-    if options.paired_ended:
-        max_qual_score = max(
-            max(qual_score_model_1.quality_scores),
-            max(qual_score_model_2.quality_scores),
-        )
-    else:
-        max_qual_score = max(qual_score_model_1.quality_scores)
-
-    local_variants = generate_variants(
-        reference=reference_contig_seq,
-        mutation_rate_regions=mutation_rate_dict_contig,
-        existing_variants=input_variants_contig,
-        mutation_model=mut_model,
-        max_qual_score=max_qual_score,
-        options=options,
+    _LOG.debug(
+        f"Generating reads for {task_id} ({original_chrom_id}:{chunk_start_offset}-{chunk_start_offset + len(reference_chunk_seqrecord.seq)})"
     )
 
-    contig_fastq_files = None  # This will now hold in-memory FASTQ data
-    contig_sam_order_data = None  # This will hold in-memory SAM order data for BAM
-
-    if options.produce_fastq or options.produce_bam:
-        (
-            fastq_data_for_contig,  # Tuple: (paired_reads_list, singleton_reads_list)
-            sam_order_data_for_contig,  # List of (read1, read2 or None) tuples
-        ) = generate_reads(
-            reference_contig_seq,
-            # local_bam_pickle_file, # Removed, SAM data handled by sam_order_data_for_contig
-            seq_error_model_1,
-            seq_error_model_2,
-            qual_score_model_1,
-            qual_score_model_2,
-            fraglen_model,
-            local_variants,
-            # options.temp_dir_path, # Removed
-            target_regions_dict_contig,
-            discard_regions_dict_contig,
-            options,
-            contig,
-        )
-        # contig_fastq_files = (
-        #     (read1_fastq_paired, read2_fastq_paired),
-        #     (read1_fastq_single, read2_fastq_single),
-        # ) # Old structure based on file paths
-        contig_fastq_files = (
-            fastq_data_for_contig  # New: directly assign the tuple of lists
-        )
-        if options.produce_bam:
-            contig_sam_order_data = sam_order_data_for_contig
-
-    return contig, local_variants, contig_fastq_files, contig_sam_order_data
+    fastq_data, sam_order_data = generate_reads(
+        reference=reference_chunk_seqrecord,
+        error_model_1=seq_error_model_1,
+        error_model_2=seq_error_model_2,
+        qual_model_1=qual_score_model_1,
+        qual_model_2=qual_score_model_2,
+        fraglen_model=fraglen_model,
+        contig_variants=variants_for_chromosome,  # Pass variants for the whole chromosome
+        targeted_regions=target_regions_for_chromosome,  # Pass regions for the whole chromosome
+        discarded_regions=discard_regions_for_chromosome,  # Pass regions for the whole chromosome
+        options=options,
+        chrom=original_chrom_id,  # Original chromosome ID
+        ref_start=chunk_start_offset,  # Global start of this chunk
+    )
+    return fastq_data, sam_order_data
 
 
 def initialize_all_models(options: Options):
@@ -216,21 +180,11 @@ def initialize_all_models(options: Options):
 def read_simulator_runner(config: str, output: str):
     """
     Run the generate_reads function, which generates simulated mutations in a dataset and corresponding files.
+    Processes chromosomes sequentially, and chunks within chromosomes in parallel for read generation.
+    FASTQ files are written per chromosome (appended). BAM and VCF are written globally at the end.
 
     :param config: This is a configuration file. Keys start with @ symbol. Everything else is ignored.
     :param output: This is the prefix for the output.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the given target or query file does not exist (or permissions
-        prevent testing existence).
-    RuntimeError
-        If given target or query file exists but is empty.
-    ValueError
-        If neither prefix nor output path was provided.
-    FileExistsError
-        If the output file already exists.
     """
     _LOG.debug(f"config = {config}")
     _LOG.debug(f"output = {output}")
@@ -361,100 +315,174 @@ def read_simulator_runner(config: str, output: str):
     """
     _LOG.info("Beginning simulation.")
 
-    breaks = find_file_breaks(reference_keys_with_lens)
+    # Removed: breaks = find_file_breaks(reference_keys_with_lens)
+    # _LOG.debug("Input reference partitioned for run") # This partitioning is now dynamic per chromosome
 
-    _LOG.debug("Input reference partitioned for run")
-
-    # these will be the features common to each contig, for multiprocessing
-    # common_features = {} # This variable was unused
-
-    local_variant_files = (
+    global_variants_for_vcf = (
         {}
-    )  # Renamed to reflect it stores variant objects/data per contig
-    # fastq_files = [] # Will now store in-memory FASTQ data directly
-    all_fastq_data = (
-        []
-    )  # List to store (paired_reads_list, singleton_reads_list) tuples from each contig
-    # sam_reads_files = [] # Will now store in-memory SAM order data directly
-    all_sam_order_data = []  # List to store SAM order data lists from each contig
+    )  # Store ContigVariants for each chromosome for the final VCF
+    global_all_sam_order_data = []  # Aggregate all SAM order data for the final BAM
 
-    # Prepare arguments for multiprocessing
-    process_args = []
-    for contig in breaks:
-        # We pass the actual sequence record for the contig now
-        reference_contig_seq = reference_index[contig]
-        input_variants_contig = input_variants_dict[contig]
-        mutation_rate_dict_contig = mutation_rate_dict[contig]
-        target_regions_dict_contig = target_regions_dict[contig]
-        discard_regions_dict_contig = discard_regions_dict[contig]
-
-        process_args.append(
-            (
-                contig,
-                reference_contig_seq,
-                input_variants_contig,
-                mutation_rate_dict_contig,
-                target_regions_dict_contig,
-                discard_regions_dict_contig,
-                mut_model,
-                seq_error_model_1,
-                seq_error_model_2,
-                qual_score_model_1,
-                qual_score_model_2,
-                fraglen_model,
-                options,
-            )
-        )
-
-    # Determine number of processes
-    # Use options.threads if specified and > 0, otherwise use cpu_count
+    # Determine number of processes for parallel chunk processing
     num_processes = (
         options.threads if options.threads and options.threads > 0 else cpu_count()
     )
-    _LOG.info(f"Using {num_processes} processes for contig processing.")
+    _LOG.info(
+        f"Using {num_processes} processes for parallel read generation on chunks."
+    )
 
-    with Pool(processes=num_processes) as pool:
-        results = pool.map(_process_single_contig, process_args)
+    # Define a target chunk size (e.g., 10 Mbp, or make this configurable)
+    # Adjusted to be an attribute of options or a constant
+    target_chunk_size = getattr(options, "chunk_size", 10_000_000)
 
-    # Process results
-    for result in results:
-        contig, local_variants, contig_fastq_data, contig_sam_data = result
-        local_variant_files[contig] = local_variants
-        if contig_fastq_data:  # This is now (paired_list, singleton_list)
-            all_fastq_data.append(contig_fastq_data)
-        if contig_sam_data:  # This is now the list of SAM ordered read tuples
-            all_sam_order_data.append(contig_sam_data)
+    # Iterate through chromosomes sequentially
+    for original_chrom_id, original_chrom_len in reference_keys_with_lens.items():
+        _LOG.info(
+            f"Processing chromosome: {original_chrom_id} (length: {original_chrom_len})"
+        )
 
-    if options.produce_vcf:
-        _LOG.info(f"Outputting golden vcf: {str(output_file_writer.vcf_fn)}")
-        output_file_writer.write_final_vcf(local_variant_files, reference_index)
+        reference_chromosome_seq_record = reference_index[original_chrom_id]
+        input_variants_for_chrom = input_variants_dict[original_chrom_id]
+        mutation_rate_regions_for_chrom = mutation_rate_dict[original_chrom_id]
+        target_regions_for_chrom = target_regions_dict[original_chrom_id]
+        discard_regions_for_chrom = discard_regions_dict[original_chrom_id]
 
-    if options.produce_fastq:
+        # 1. Generate variants for the entire current chromosome
+        _LOG.info(f"Generating variants for {original_chrom_id}")
         if options.paired_ended:
-            _LOG.info(
-                f"Outputting fastq files: "
-                f"{', '.join([str(x) for x in output_file_writer.fastq_fns]).strip(', ')}"
+            max_qual_score = max(
+                max(qual_score_model_1.quality_scores),
+                max(qual_score_model_2.quality_scores) if qual_score_model_2 else 0,
             )
         else:
-            _LOG.info(f"Outputting fastq file: {output_file_writer.fastq_fns[0]}")
-        output_file_writer.write_fastqs_from_memory(
-            all_fastq_data, options.rng
-        )  # Changed from merge_temp_fastqs
+            max_qual_score = max(qual_score_model_1.quality_scores)
 
+        variants_for_current_chrom = generate_variants(
+            reference=reference_chromosome_seq_record,
+            mutation_rate_regions=mutation_rate_regions_for_chrom,
+            existing_variants=input_variants_for_chrom,
+            mutation_model=mut_model,
+            max_qual_score=max_qual_score,
+            options=options,
+        )
+        global_variants_for_vcf[original_chrom_id] = variants_for_current_chrom
+        _LOG.info(f"Finished generating variants for {original_chrom_id}")
+
+        # 2. Define chunks for the current chromosome for parallel read generation
+        chunks_for_this_chromosome = []
+        num_chunks = max(1, ceil(original_chrom_len / target_chunk_size))
+        actual_chunk_size = ceil(original_chrom_len / num_chunks)
+
+        for i in range(num_chunks):
+            chunk_start = i * actual_chunk_size
+            chunk_end = min((i + 1) * actual_chunk_size, original_chrom_len)
+            if chunk_start < chunk_end:  # Ensure chunk is not empty
+                task_id = f"{original_chrom_id}_chunk{i}"
+                # Create a SeqRecord for the chunk. ID should be original_chrom_id for Read object consistency.
+                chunk_seq_slice = reference_chromosome_seq_record.seq[
+                    chunk_start:chunk_end
+                ]
+                # Pass the original ID and description for the SeqRecord of the chunk
+                chunk_seq_record = SeqRecord(
+                    chunk_seq_slice,
+                    id=original_chrom_id,
+                    name=original_chrom_id,
+                    description=reference_chromosome_seq_record.description,
+                )
+                chunks_for_this_chromosome.append(
+                    (
+                        task_id,
+                        original_chrom_id,
+                        chunk_start,  # This is ref_start for generate_reads
+                        chunk_seq_record,
+                        variants_for_current_chrom,  # Pass the variants for the whole chromosome
+                        seq_error_model_1,
+                        seq_error_model_2,
+                        qual_score_model_1,
+                        qual_score_model_2,
+                        fraglen_model,
+                        target_regions_for_chrom,  # Pass regions for the whole chromosome
+                        discard_regions_for_chrom,  # Pass regions for the whole chromosome
+                        options,
+                    )
+                )
+
+        if not chunks_for_this_chromosome:
+            _LOG.warning(
+                f"No chunks generated for chromosome {original_chrom_id}, skipping read generation."
+            )
+            continue
+
+        # 3. Generate reads in parallel for the chunks of the current chromosome
+        _LOG.info(
+            f"Generating reads for {len(chunks_for_this_chromosome)} chunks in {original_chrom_id} using {num_processes} processes..."
+        )
+
+        all_fastq_data_for_chrom = []
+        # Use a context manager for the pool if possible, or ensure it's closed.
+        # If num_processes is 1, Pool might not be necessary, can run serially.
+        if num_processes > 1 and len(chunks_for_this_chromosome) > 1:
+            with Pool(processes=num_processes) as pool:
+                results_for_chrom_chunks = pool.map(
+                    _generate_reads_for_chunk, chunks_for_this_chromosome
+                )
+        else:  # Run serially if only one process or one chunk
+            results_for_chrom_chunks = [
+                _generate_reads_for_chunk(args) for args in chunks_for_this_chromosome
+            ]
+
+        for fastq_data_chunk, sam_order_data_chunk in results_for_chrom_chunks:
+            if fastq_data_chunk:
+                all_fastq_data_for_chrom.append(fastq_data_chunk)
+            if sam_order_data_chunk:
+                global_all_sam_order_data.append(sam_order_data_chunk)
+
+        _LOG.info(f"Finished generating reads for {original_chrom_id}.")
+
+        # 4. Write FASTQ data for the current chromosome (appends for subsequent chromosomes)
+        if options.produce_fastq and all_fastq_data_for_chrom:
+            if options.paired_ended:
+                _LOG.info(
+                    f"Writing/Appending FASTQ data for {original_chrom_id} to: "
+                    f"{', '.join([str(x) for x in output_file_writer.fastq_fns if x.name != 'dummy.fastq.gz']).strip(', ')}"
+                )
+            else:
+                _LOG.info(
+                    f"Writing/Appending FASTQ data for {original_chrom_id} to: {output_file_writer.fastq_fns[0]}"
+                )
+            output_file_writer.write_fastqs_from_memory(
+                all_fastq_data_for_chrom, options.rng
+            )
+        elif options.produce_fastq:
+            _LOG.info(
+                f"No FASTQ data generated for chromosome {original_chrom_id} to write."
+            )
+
+    # After processing all chromosomes:
+    # Write VCF (globally collected variants)
+    if options.produce_vcf:
+        _LOG.info(f"Outputting golden vcf: {str(output_file_writer.vcf_fn)}")
+        output_file_writer.write_final_vcf(global_variants_for_vcf, reference_index)
+
+    # Write BAM (globally collected SAM order data)
     if options.produce_bam:
         _LOG.info(f"Outputting golden bam file: {str(output_file_writer.bam_fn)}")
-        contig_list = list(reference_keys_with_lens)
+        contig_list = list(
+            reference_keys_with_lens
+        )  # Original contig list for BAM header
         contigs_by_index = {contig_list[n]: n for n in range(len(contig_list))}
         output_file_writer.output_bam_file(
-            all_sam_order_data,
-            contigs_by_index,
-            options.read_len,  # Changed from sam_reads_files
+            global_all_sam_order_data, contigs_by_index, options.read_len
         )
+
+    _LOG.info("Read simulation finished.")
 
 
 def find_file_breaks(reference_keys_with_lens: dict) -> dict:
     """
-    Returns a dictionary with the chromosomes as keys, which is the start of building the chromosome map
+    Returns a dictionary with the chromosomes as keys, which is the start of building the chromosome map.
+    This function is currently not used for parallelization in the new scheme but kept for potential other uses
+    or if the old parallelization strategy is revisited.
 
     :param reference_keys_with_lens: a dictionary with chromosome keys and sequence values
     :return: a dictionary containing the chromosomes as keys and either "all" for values, or a list of indices
